@@ -76,7 +76,18 @@ The detection uses a two-stage approach to prevent misclassification:
 - **Watch pages**: `/watch` path, container selectors: `#comments`, `ytd-comments`
 - **Shorts pages**: `/shorts` path, container selectors include `ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-comments-section"]`
 
-URL observer detects SPA navigation and reinitializes observers when switching between page types.
+### SPA Navigation Handling
+
+YouTube is a single-page application, so the extension uses:
+
+1. **URL polling** (every 500ms) to detect navigation between videos/page types
+2. **Root observer** watches `document.body` for comment container appearance (needed for Shorts where comments panel is dynamically mounted)
+3. **Comment observer** watches the actual comment container for new comments
+
+On URL change:
+1. All observers are disconnected and cleaned up
+2. After 500ms delay (to let YouTube render), observers are re-initialized
+3. Existing comments in the new container are processed
 
 ### YouTube DOM Selectors
 
