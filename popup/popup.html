@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Language Filter</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Language Filter</h1>
+      <div class="toggle-row">
+        <label for="enableToggle">Enable filtering</label>
+        <label class="switch">
+          <input type="checkbox" id="enableToggle">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2>Allowed Languages</h2>
+      <p class="hint">Comments in these languages will be shown</p>
+      <div id="languageList" class="language-list"></div>
+    </section>
+
+    <section class="section">
+      <h2>Display Mode</h2>
+      <div class="radio-group">
+        <label class="radio-label">
+          <input type="radio" name="mode" value="hide">
+          <span class="radio-text">
+            <strong>Hide</strong>
+            <small>Completely hide non-allowed comments</small>
+          </span>
+        </label>
+        <label class="radio-label">
+          <input type="radio" name="mode" value="collapse">
+          <span class="radio-text">
+            <strong>Collapse</strong>
+            <small>Show placeholder with option to expand</small>
+          </span>
+        </label>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>Unknown Languages</h2>
+      <p class="hint">When language cannot be detected</p>
+      <label class="checkbox-label">
+        <input type="checkbox" id="hideUnknown">
+        <span>Hide comments with unknown language</span>
+      </label>
+    </section>
+
+    <section class="section actions">
+      <button id="rescanBtn" class="btn btn-primary">
+        Re-scan Current Page
+      </button>
+    </section>
+
+    <footer>
+      <p id="status" class="status"></p>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

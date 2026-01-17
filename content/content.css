@@ -1,0 +1,77 @@
+/* YouTube Language Filter - Content Styles */
+
+/* Hidden mode - completely hide the comment */
+.ylf-hidden {
+  display: none !important;
+}
+
+/* Collapsed mode - dim the comment area */
+.ylf-collapsed {
+  opacity: 0.7;
+}
+
+/* Placeholder for collapsed comments */
+.ylf-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 8px;
+  font-family: 'Roboto', 'Arial', sans-serif;
+  font-size: 13px;
+}
+
+/* Dark theme support */
+html[dark] .ylf-placeholder,
+[dark] .ylf-placeholder,
+ytd-app[darker-dark-theme] .ylf-placeholder {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.ylf-placeholder-text {
+  color: #606060;
+  user-select: none;
+}
+
+html[dark] .ylf-placeholder-text,
+[dark] .ylf-placeholder-text,
+ytd-app[darker-dark-theme] .ylf-placeholder-text {
+  color: #aaa;
+}
+
+.ylf-show-btn {
+  padding: 6px 12px;
+  border: none;
+  border-radius: 18px;
+  background: #065fd4;
+  color: white;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.ylf-show-btn:hover {
+  background: #0051b5;
+}
+
+.ylf-show-btn:active {
+  background: #004499;
+}
+
+/* Expanded state after user clicks show */
+.ylf-expanded {
+  opacity: 1;
+}
+
+.ylf-expanded .ylf-placeholder {
+  background: rgba(6, 95, 212, 0.1);
+}
+
+html[dark] .ylf-expanded .ylf-placeholder,
+[dark] .ylf-expanded .ylf-placeholder,
+ytd-app[darker-dark-theme] .ylf-expanded .ylf-placeholder {
+  background: rgba(6, 95, 212, 0.2);
+}
