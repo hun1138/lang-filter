@@ -29,13 +29,26 @@
 
   // Observer references - must be cleaned up on re-init
   let commentObserver = null;
-  let rootObserver = null;      // Observes for comment container appearance
-  let urlCheckInterval = null;  // Polling for URL changes (more reliable than MutationObserver)
+  let rootObserver = null;
+  let urlCheckInterval = null;
 
   // Track current state
   let lastUrl = '';
   let currentPageType = null;
   let isInitialized = false;
+
+  /**
+   * Generation ID for async operation invalidation.
+   * "Extension context invalidated" error happens when:
+   * - chrome.i18n.detectLanguage callback fires after the content script context was destroyed
+   * - This occurs during SPA navigation or extension reload
+   *
+   * By tracking a generation ID, we can discard stale async results:
+   * - Each RESCAN/navigation increments generationId
+   * - Async operations capture the current generationId
+   * - When results arrive, if generationId changed, we ignore the result
+   */
+  let generationId = 0;
 
   // ===========================================
   // CONSTANTS
@@ -43,7 +56,7 @@
   const DEBOUNCE_MS = 200;
   const BATCH_SIZE = 20;
   const SAMPLE_LENGTH = 200;
-  const URL_CHECK_INTERVAL_MS = 500;  // Check URL every 500ms for SPA navigation
+  const URL_CHECK_INTERVAL_MS = 500;
 
   // CSS classes
   const CLASS_HIDDEN = 'ylf-hidden';
@@ -63,12 +76,40 @@
   const URL_REGEX = /https?:\/\/[^\s]+/g;
 
   // ===========================================
-  // PAGE TYPE DETECTION
+  // RUNTIME CONTEXT VALIDATION
   // ===========================================
   /**
-   * Detects current page type based on URL path.
-   * Returns: 'watch' | 'shorts' | null
+   * Checks if the extension runtime context is still valid.
+   * Returns false if the context has been invalidated (e.g., extension reloaded).
    */
+  function isRuntimeValid() {
+    try {
+      return !!(chrome.runtime && chrome.runtime.id);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * Starts a new generation - call this before any rescan/reprocess operation.
+   * Returns the new generation ID for tracking async operations.
+   */
+  function newGeneration() {
+    generationId++;
+    return generationId;
+  }
+
+  /**
+   * Checks if a generation ID is still current.
+   * Used to discard stale async results.
+   */
+  function isCurrentGeneration(gen) {
+    return gen === generationId;
+  }
+
+  // ===========================================
+  // PAGE TYPE DETECTION
+  // ===========================================
   function detectPageType() {
     const path = window.location.pathname;
     if (path.startsWith('/watch')) return 'watch';
@@ -79,25 +120,14 @@
   // ===========================================
   // COMMENT CONTAINER DISCOVERY
   // ===========================================
-  /**
-   * Finds the comment root container based on page type.
-   *
-   * Watch pages: Comments are in #comments or ytd-comments
-   * Shorts pages: Comments are in an engagement panel that may not exist initially
-   *               The panel appears when user clicks the comments button
-   */
   function findCommentsRoot(pageType) {
     if (pageType === 'watch') {
-      // Watch page: standard comment section
       return document.querySelector('#comments') ||
              document.querySelector('ytd-comments') ||
              document.querySelector('#content.ytd-comments');
     }
 
     if (pageType === 'shorts') {
-      // Shorts page: comments are in engagement panel
-      // The panel is dynamically mounted when user opens comments
-      // Try multiple selectors as YouTube's structure may vary
       return document.querySelector('ytd-engagement-panel-section-list-renderer[target-id="engagement-panel-comments-section"]') ||
              document.querySelector('ytd-engagement-panel-section-list-renderer[visibility="ENGAGEMENT_PANEL_VISIBILITY_EXPANDED"]') ||
              document.querySelector('#engagement-panel-comments-section') ||
@@ -107,10 +137,6 @@
     return null;
   }
 
-  /**
-   * Gets selectors for finding individual comment elements.
-   * Same selectors work for both Watch and Shorts.
-   */
   function getCommentSelectors() {
     return 'ytd-comment-thread-renderer, ytd-comment-renderer';
   }
@@ -151,7 +177,7 @@
     const hanRatio = hanCount / totalScriptChars;
     const latinRatio = latinCount / totalScriptChars;
 
-    // Korean detection - ㅋㅋㅋ and other Hangul Jamo are caught here
+    // Korean detection
     if (hangulCount >= 2 && (hangulRatio >= 0.20 || hangulCount > kanaCount)) {
       return { lang: 'ko', confidence: 'high' };
     }
@@ -196,9 +222,53 @@
   }
 
   // ===========================================
+  // SAFE CHROME LANGUAGE DETECTION WRAPPER
+  // ===========================================
+  /**
+   * Safely calls chrome.i18n.detectLanguage with generation checking.
+   * Prevents "Extension context invalidated" errors from crashing the pipeline.
+   *
+   * @param {string} sample - Text to analyze
+   * @param {number} gen - Generation ID when this call was initiated
+   * @returns {Promise<{languages: Array}|null>} - Detection result or null if stale/error
+   */
+  function safeDetectLanguage(sample, gen) {
+    return new Promise((resolve) => {
+      // Check if runtime is valid before calling
+      if (!isRuntimeValid()) {
+        resolve(null);
+        return;
+      }
+
+      try {
+        chrome.i18n.detectLanguage(sample, (result) => {
+          // Check if this result is still relevant
+          if (!isCurrentGeneration(gen)) {
+            // Generation changed while we were waiting - discard result
+            resolve(null);
+            return;
+          }
+
+          // Check for runtime errors
+          if (chrome.runtime.lastError) {
+            // Context invalidated or other error - gracefully fail
+            resolve(null);
+            return;
+          }
+
+          resolve(result);
+        });
+      } catch (error) {
+        // Extension context invalidated
+        resolve(null);
+      }
+    });
+  }
+
+  // ===========================================
   // HYBRID LANGUAGE DETECTION
   // ===========================================
-  async function detectLanguage(text) {
+  async function detectLanguage(text, gen) {
     const cacheKey = text.substring(0, 100);
     if (langCache.has(cacheKey)) {
       return langCache.get(cacheKey);
@@ -222,41 +292,38 @@
       return result;
     }
 
-    // Fallback to chrome.i18n.detectLanguage
+    // Fallback to chrome.i18n.detectLanguage with safety wrapper
     const sample = text.substring(0, SAMPLE_LENGTH);
+    const chromeResult = await safeDetectLanguage(sample, gen);
 
-    try {
-      const chromeResult = await new Promise((resolve) => {
-        chrome.i18n.detectLanguage(sample, resolve);
-      });
-
-      let result = { lang: 'unknown', isUnknown: true, confidence: 'low' };
-
-      if (chromeResult?.languages?.length > 0) {
-        const topLang = chromeResult.languages.reduce((a, b) =>
-          (a.percentage > b.percentage) ? a : b
-        );
-
-        const detectedLang = normalizeLanguageCode(topLang.language);
-        const isValid = validateChromeResult(detectedLang, text);
-
-        if (topLang.percentage >= 40 && isValid) {
-          result = {
-            lang: detectedLang,
-            isUnknown: false,
-            confidence: topLang.percentage >= 70 ? 'high' : 'medium'
-          };
-        }
-      }
-
-      langCache.set(cacheKey, result);
-      return result;
-    } catch (error) {
-      console.error('[YLF] Language detection failed:', error);
+    // If null, detection was stale or failed - return unknown
+    if (!chromeResult) {
       const result = { lang: 'unknown', isUnknown: true, confidence: 'low' };
-      langCache.set(cacheKey, result);
+      // Don't cache stale results
       return result;
     }
+
+    let result = { lang: 'unknown', isUnknown: true, confidence: 'low' };
+
+    if (chromeResult.languages && chromeResult.languages.length > 0) {
+      const topLang = chromeResult.languages.reduce((a, b) =>
+        (a.percentage > b.percentage) ? a : b
+      );
+
+      const detectedLang = normalizeLanguageCode(topLang.language);
+      const isValid = validateChromeResult(detectedLang, text);
+
+      if (topLang.percentage >= 40 && isValid) {
+        result = {
+          lang: detectedLang,
+          isUnknown: false,
+          confidence: topLang.percentage >= 70 ? 'high' : 'medium'
+        };
+      }
+    }
+
+    langCache.set(cacheKey, result);
+    return result;
   }
 
   function validateChromeResult(detectedLang, text) {
@@ -299,7 +366,10 @@
   // ===========================================
   // COMMENT PROCESSING
   // ===========================================
-  function queueComments(comments) {
+  function queueComments(comments, gen) {
+    // Check if this generation is still current
+    if (!isCurrentGeneration(gen)) return;
+
     const newComments = comments.filter(c => {
       if (c.hasAttribute(DATA_PROCESSED)) return false;
       if (c.classList.contains(CLASS_PROCESSED)) return false;
@@ -312,20 +382,26 @@
     if (processTimeout) {
       clearTimeout(processTimeout);
     }
-    processTimeout = setTimeout(processQueue, DEBOUNCE_MS);
+    processTimeout = setTimeout(() => processQueue(gen), DEBOUNCE_MS);
   }
 
-  async function processQueue() {
+  async function processQueue(gen) {
+    // Check if this generation is still current
+    if (!isCurrentGeneration(gen)) {
+      pendingComments = [];
+      return;
+    }
+
     if (isProcessing || pendingComments.length === 0) return;
 
     isProcessing = true;
 
     try {
-      while (pendingComments.length > 0) {
+      while (pendingComments.length > 0 && isCurrentGeneration(gen)) {
         const batch = pendingComments.splice(0, BATCH_SIZE);
-        await processBatch(batch);
+        await processBatch(batch, gen);
 
-        if (pendingComments.length > 0) {
+        if (pendingComments.length > 0 && isCurrentGeneration(gen)) {
           await new Promise(resolve => setTimeout(resolve, 10));
         }
       }
@@ -334,12 +410,14 @@
     }
   }
 
-  async function processBatch(comments) {
-    const promises = comments.map(comment => processComment(comment));
+  async function processBatch(comments, gen) {
+    const promises = comments.map(comment => processComment(comment, gen));
     await Promise.all(promises);
   }
 
-  async function processComment(commentElement) {
+  async function processComment(commentElement, gen) {
+    // Check if still current generation
+    if (!isCurrentGeneration(gen)) return;
     if (!settings.enabled) return;
 
     let renderer = commentElement;
@@ -359,7 +437,11 @@
       return;
     }
 
-    const detection = await detectLanguage(text);
+    const detection = await detectLanguage(text, gen);
+
+    // Check again after async operation
+    if (!isCurrentGeneration(gen)) return;
+
     const shouldFilter = shouldFilterComment(detection);
     applyFilter(commentElement, renderer, shouldFilter, detection);
     markProcessed(commentElement);
@@ -453,11 +535,7 @@
   // ===========================================
   // OBSERVER MANAGEMENT
   // ===========================================
-  /**
-   * Sets up MutationObserver on the comments container.
-   * Called when we find a valid comment root.
-   */
-  function observeComments(root) {
+  function observeComments(root, gen) {
     if (commentObserver) {
       commentObserver.disconnect();
       commentObserver = null;
@@ -467,6 +545,7 @@
 
     commentObserver = new MutationObserver((mutations) => {
       if (!settings.enabled) return;
+      if (!isCurrentGeneration(gen)) return;
 
       const newComments = [];
 
@@ -485,7 +564,7 @@
       }
 
       if (newComments.length > 0) {
-        queueComments(newComments);
+        queueComments(newComments, gen);
       }
     });
 
@@ -494,41 +573,32 @@
       subtree: true
     });
 
-    // Process any existing comments in the container
+    // Process existing comments
     const existingComments = root.querySelectorAll(getCommentSelectors());
     if (existingComments.length > 0) {
-      queueComments([...existingComments]);
+      queueComments([...existingComments], gen);
     }
   }
 
-  /**
-   * Sets up a root observer that watches for the comments container to appear.
-   * This is needed for Shorts where the comments panel is dynamically mounted.
-   * Also needed for Watch when navigating via SPA.
-   */
-  function setupRootObserver() {
+  function setupRootObserver(gen) {
     if (rootObserver) {
       rootObserver.disconnect();
       rootObserver = null;
     }
 
-    // Try to find comments root immediately
     const pageType = detectPageType();
     const root = findCommentsRoot(pageType);
 
     if (root) {
-      // Comments container exists, observe it
-      observeComments(root);
+      observeComments(root, gen);
     }
 
-    // Also watch for the container to appear/change
-    // We observe the body for changes that might include our target container
     rootObserver = new MutationObserver(() => {
-      const currentRoot = findCommentsRoot(detectPageType());
+      if (!isCurrentGeneration(gen)) return;
 
-      // If we found a root and don't have an active comment observer on it
-      if (currentRoot && (!commentObserver || !currentRoot.contains(document.body))) {
-        observeComments(currentRoot);
+      const currentRoot = findCommentsRoot(detectPageType());
+      if (currentRoot && !commentObserver) {
+        observeComments(currentRoot, gen);
       }
     });
 
@@ -538,9 +608,6 @@
     });
   }
 
-  /**
-   * Cleans up all observers. Called before re-initialization.
-   */
   function resetObservers() {
     if (commentObserver) {
       commentObserver.disconnect();
@@ -561,14 +628,6 @@
   // ===========================================
   // URL CHANGE DETECTION (SPA NAVIGATION)
   // ===========================================
-  /**
-   * Sets up URL polling to detect SPA navigation.
-   * MutationObserver on document is less reliable than polling for URL changes.
-   * This handles:
-   * - Switching from /watch to /shorts
-   * - Switching between different /shorts videos
-   * - Switching between different /watch videos
-   */
   function setupUrlWatcher() {
     if (urlCheckInterval) {
       clearInterval(urlCheckInterval);
@@ -584,17 +643,15 @@
         lastUrl = newUrl;
         const newPageType = detectPageType();
 
-        // URL changed - need to re-initialize
-        // This handles both page type changes and same-type navigation
+        // URL changed - invalidate old generation and start fresh
         if (newPageType) {
-          // Small delay to let YouTube render the new page
           setTimeout(() => {
             resetObservers();
             currentPageType = newPageType;
-            setupRootObserver();
+            const gen = newGeneration();
+            setupRootObserver(gen);
           }, 500);
         } else {
-          // Navigated away from watch/shorts
           resetObservers();
           currentPageType = null;
         }
@@ -605,17 +662,21 @@
   // ===========================================
   // PROCESS ALL VISIBLE COMMENTS
   // ===========================================
-  function processAllComments() {
+  function processAllComments(gen) {
     if (!settings.enabled) return;
+    if (!isCurrentGeneration(gen)) return;
 
     const pageType = detectPageType();
     if (!pageType) return;
 
     const comments = document.querySelectorAll(getCommentSelectors());
-    queueComments([...comments]);
+    queueComments([...comments], gen);
   }
 
   function reprocessAllComments() {
+    // Start new generation to invalidate any pending async operations
+    const gen = newGeneration();
+
     // Clear processed markers
     const processed = document.querySelectorAll('.' + CLASS_PROCESSED);
     processed.forEach(el => {
@@ -629,35 +690,52 @@
     });
 
     langCache.clear();
-    processAllComments();
+    processAllComments(gen);
   }
 
   // ===========================================
   // MESSAGE HANDLING
   // ===========================================
   function handleMessage(message, _sender, sendResponse) {
+    // PING handler - confirms content script is alive
+    if (message.type === 'PING') {
+      sendResponse({
+        ok: true,
+        page: location.href,
+        ts: Date.now()
+      });
+      return true;
+    }
+
     if (message.type === 'SETTINGS_UPDATED') {
       settings = { ...DEFAULT_SETTINGS, ...message.settings };
       reprocessAllComments();
       sendResponse({ success: true });
-    } else if (message.type === 'RESCAN') {
+      return true;
+    }
+
+    if (message.type === 'RESCAN') {
       reprocessAllComments();
       sendResponse({ success: true });
+      return true;
     }
-    return true;
+
+    return false;
   }
 
   // ===========================================
   // INITIALIZATION
   // ===========================================
   async function loadSettings() {
+    if (!isRuntimeValid()) return;
+
     try {
       const result = await chrome.storage.local.get('settings');
       if (result.settings) {
         settings = { ...DEFAULT_SETTINGS, ...result.settings };
       }
     } catch (error) {
-      console.error('[YLF] Failed to load settings:', error);
+      // Context may be invalid - ignore
     }
   }
 
@@ -667,8 +745,10 @@
 
     await loadSettings();
 
-    // Set up message listener (only once)
-    chrome.runtime.onMessage.addListener(handleMessage);
+    // Set up message listener
+    if (isRuntimeValid()) {
+      chrome.runtime.onMessage.addListener(handleMessage);
+    }
 
     // Set up URL watcher for SPA navigation
     setupUrlWatcher();
@@ -677,7 +757,8 @@
     const pageType = detectPageType();
     if (pageType) {
       currentPageType = pageType;
-      setupRootObserver();
+      const gen = newGeneration();
+      setupRootObserver(gen);
     }
   }
 

@@ -37,7 +37,113 @@ let statusEl;
 // Current settings
 let settings = { ...DEFAULT_SETTINGS };
 
-// Initialize popup
+// ===========================================
+// CONTENT SCRIPT COMMUNICATION HELPERS
+// ===========================================
+
+/**
+ * Sends a PING to the content script to check if it's alive.
+ * "Receiving end does not exist" error happens when:
+ * - Content script hasn't loaded yet
+ * - Page was navigated (SPA) and old context was destroyed
+ * - Extension was reloaded but page wasn't refreshed
+ *
+ * @param {number} tabId
+ * @returns {Promise<boolean>} true if content script responded
+ */
+async function pingContentScript(tabId) {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+    return response && response.ok === true;
+  } catch (error) {
+    // "Receiving end does not exist" or similar
+    return false;
+  }
+}
+
+/**
+ * Injects the content script into the tab.
+ * Used when PING fails, meaning content script isn't present.
+ *
+ * @param {number} tabId
+ * @returns {Promise<boolean>} true if injection succeeded
+ */
+async function injectContentScript(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content/content.js']
+    });
+    await chrome.scripting.insertCSS({
+      target: { tabId },
+      files: ['content/content.css']
+    });
+    // Small delay to let the script initialize
+    await new Promise(resolve => setTimeout(resolve, 200));
+    return true;
+  } catch (error) {
+    console.error('[YLF Popup] Failed to inject content script:', error);
+    return false;
+  }
+}
+
+/**
+ * Ensures content script is present and responsive.
+ * Implements PING → inject → retry PING pattern.
+ *
+ * @param {number} tabId
+ * @returns {Promise<boolean>} true if content script is ready
+ */
+async function ensureContentScript(tabId) {
+  // First attempt: PING
+  if (await pingContentScript(tabId)) {
+    return true;
+  }
+
+  // Content script not responding, try to inject it
+  const injected = await injectContentScript(tabId);
+  if (!injected) {
+    return false;
+  }
+
+  // Retry PING after injection
+  return await pingContentScript(tabId);
+}
+
+/**
+ * Sends a command to the content script with automatic injection if needed.
+ *
+ * @param {number} tabId
+ * @param {object} message
+ * @returns {Promise<{success: boolean, response?: any, error?: string}>}
+ */
+async function sendCommand(tabId, message) {
+  // Ensure content script is present
+  const ready = await ensureContentScript(tabId);
+  if (!ready) {
+    return {
+      success: false,
+      error: 'Cannot connect to this page. Please refresh the tab.'
+    };
+  }
+
+  // Send the actual command
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, message);
+    return { success: true, response };
+  } catch (error) {
+    console.error('[YLF Popup] Command failed:', error);
+    return {
+      success: false,
+      error: 'Connection lost. Please refresh the tab.'
+    };
+  }
+}
+
+// ===========================================
+// INITIALIZATION
+// ===========================================
+
 document.addEventListener('DOMContentLoaded', async () => {
   // Cache DOM elements
   enableToggle = document.getElementById('enableToggle');
@@ -148,14 +254,15 @@ async function saveAndNotify() {
     // Notify content script
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tabs[0] && tabs[0].url && tabs[0].url.includes('youtube.com')) {
-      try {
-        await chrome.tabs.sendMessage(tabs[0].id, {
-          type: 'SETTINGS_UPDATED',
-          settings
-        });
+      const result = await sendCommand(tabs[0].id, {
+        type: 'SETTINGS_UPDATED',
+        settings
+      });
+
+      if (result.success) {
         showStatus('Settings applied', 'success');
-      } catch (error) {
-        // Content script might not be loaded yet
+      } else {
+        // Settings saved but couldn't notify - that's OK
         showStatus('Settings saved (reload page to apply)', 'success');
       }
     } else {
@@ -178,16 +285,23 @@ async function rescanCurrentPage() {
       return;
     }
 
-    if (!tabs[0].url.includes('youtube.com/watch')) {
-      showStatus('Not a YouTube watch page', 'error');
+    // Check if it's a YouTube page (watch or shorts)
+    const url = tabs[0].url;
+    if (!url.includes('youtube.com/watch') && !url.includes('youtube.com/shorts')) {
+      showStatus('Not a YouTube video page', 'error');
       return;
     }
 
-    await chrome.tabs.sendMessage(tabs[0].id, { type: 'RESCAN' });
-    showStatus('Page rescanned', 'success');
+    const result = await sendCommand(tabs[0].id, { type: 'RESCAN' });
+
+    if (result.success) {
+      showStatus('Page rescanned', 'success');
+    } else {
+      showStatus(result.error || 'Failed to rescan', 'error');
+    }
   } catch (error) {
     console.error('Failed to rescan:', error);
-    showStatus('Failed to rescan (try reloading page)', 'error');
+    showStatus('Failed to rescan. Please refresh the page.', 'error');
   } finally {
     rescanBtn.disabled = false;
   }
